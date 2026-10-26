@@ -1,0 +1,127 @@
+name: Oracle crear VM eclipta
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: oracle-crear-vm
+  cancel-in-progress: false
+
+jobs:
+  intento:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+    steps:
+      - name: Instalar oci-cli
+        run: pip install --quiet oci-cli
+
+      - name: Configurar credenciales de Oracle
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          for v in "$OCI_USER_OCID" "$OCI_TENANCY_OCID" "$OCI_FINGERPRINT" "$OCI_REGION"; do
+            echo "::add-mask::$v"
+          done
+          mkdir -p ~/.oci
+          chmod 700 ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          {
+            echo "[DEFAULT]"
+            echo "user=$OCI_USER_OCID"
+            echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY_OCID"
+            echo "region=$OCI_REGION"
+            echo "key_file=$HOME/.oci/key.pem"
+          } > ~/.oci/config
+          chmod 600 ~/.oci/config
+
+      - name: Intentar crear la VM
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set +x
+          set -u
+          NAME=eclipta
+
+          disable_self() {
+            gh workflow disable "$GITHUB_WORKFLOW" --repo "$GITHUB_REPOSITORY" || \
+              echo "No pude desactivar el workflow; desactivalo a mano en Actions."
+          }
+
+          EXISTING=$(oci compute instance list -c "$OCI_TENANCY_OCID" --display-name "$NAME" \
+            --query 'data[?"lifecycle-state"!=`TERMINATED`&&"lifecycle-state"!=`TERMINATING`].id | [0]' \
+            --raw-output 2>/dev/null || true)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "Ya existe una instancia $NAME. Desactivando el workflow."
+            disable_self
+            exit 0
+          fi
+
+          AD=$(oci iam availability-domain list -c "$OCI_TENANCY_OCID" \
+            --query 'data[0].name' --raw-output)
+          SUBNET=$(oci network subnet list -c "$OCI_TENANCY_OCID" \
+            --query 'sort_by(data[?"prohibit-public-ip-on-vnic"==`false`],&"time-created")[-1].id' \
+            --raw-output)
+          if [ -z "$SUBNET" ] || [ "$SUBNET" = "null" ]; then
+            echo "No hay subred publica. Crea una VCN con subred publica en Oracle."
+            exit 1
+          fi
+          IMAGE=$(oci compute image list -c "$OCI_TENANCY_OCID" \
+            --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+            --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED --sort-order DESC \
+            --query 'data[0].id' --raw-output)
+          if [ -z "$IMAGE" ] || [ "$IMAGE" = "null" ]; then
+            echo "No encontre imagen Ubuntu 24.04 para A1."
+            exit 1
+          fi
+
+          FD="FAULT-DOMAIN-$(( RANDOM % 3 + 1 ))"
+          printf '%s\n' "$SSH_PUBLIC_KEY" > /tmp/ssh_key.pub
+          echo "Intentando lanzar en $FD ..."
+
+          set +e
+          OUT=$(oci compute instance launch \
+            --compartment-id "$OCI_TENANCY_OCID" \
+            --availability-domain "$AD" \
+            --fault-domain "$FD" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+            --display-name "$NAME" \
+            --image-id "$IMAGE" \
+            --subnet-id "$SUBNET" \
+            --assign-public-ip true \
+            --boot-volume-size-in-gbs 200 \
+            --ssh-authorized-keys-file /tmp/ssh_key.pub 2>&1)
+          RC=$?
+          set -e
+          rm -f /tmp/ssh_key.pub
+
+          if [ $RC -eq 0 ]; then
+            echo "VM creada. Desactivando el workflow."
+            disable_self
+            exit 0
+          fi
+
+          if printf '%s' "$OUT" | grep -qiE 'out of (host )?capacity|TooManyRequests|"status": 429'; then
+            echo "sin hueco todavia"
+            exit 0
+          fi
+
+          echo "Error inesperado de Oracle:"
+          printf '%s\n' "$OUT" | tail -n 15
+          exit 1
