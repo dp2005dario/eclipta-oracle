@@ -37,7 +37,7 @@ jobs:
           done
           mkdir -p ~/.oci
           chmod 700 ~/.oci
-          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          printf '%s' "$OCI_PRIVATE_KEY" | base64 -d > ~/.oci/key.pem
           chmod 600 ~/.oci/key.pem
           {
             echo "[DEFAULT]"
