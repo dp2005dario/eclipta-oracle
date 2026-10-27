@@ -2,7 +2,7 @@ name: Oracle crear VM eclipta
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,7 @@ concurrency:
 jobs:
   intento:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 345
     env:
       GH_TOKEN: ${{ github.token }}
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
@@ -63,65 +63,73 @@ jobs:
               echo "No pude desactivar el workflow; desactivalo a mano en Actions."
           }
 
-          EXISTING=$(oci compute instance list -c "$OCI_TENANCY_OCID" --display-name "$NAME" \
-            --query 'data[?"lifecycle-state"!=`TERMINATED`&&"lifecycle-state"!=`TERMINATING`].id | [0]' \
-            --raw-output 2>/dev/null || true)
-          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-            echo "Ya existe una instancia $NAME. Desactivando el workflow."
-            disable_self
-            exit 0
-          fi
+          for i in $(seq 1 75); do
+            TS=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
 
-          AD=$(oci iam availability-domain list -c "$OCI_TENANCY_OCID" \
-            --query 'data[0].name' --raw-output)
-          SUBNET=$(oci network subnet list -c "$OCI_TENANCY_OCID" \
-            --query 'sort_by(data[?"prohibit-public-ip-on-vnic"==`false`],&"time-created")[-1].id' \
-            --raw-output)
-          if [ -z "$SUBNET" ] || [ "$SUBNET" = "null" ]; then
-            echo "No hay subred publica. Crea una VCN con subred publica en Oracle."
-            exit 1
-          fi
-          IMAGE=$(oci compute image list -c "$OCI_TENANCY_OCID" \
-            --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
-            --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED --sort-order DESC \
-            --query 'data[0].id' --raw-output)
-          if [ -z "$IMAGE" ] || [ "$IMAGE" = "null" ]; then
-            echo "No encontre imagen Ubuntu 24.04 para A1."
-            exit 1
-          fi
+            EXISTING=$(oci compute instance list -c "$OCI_TENANCY_OCID" --display-name "$NAME" \
+              --query 'data[?"lifecycle-state"!=`TERMINATED`&&"lifecycle-state"!=`TERMINATING`].id | [0]' \
+              --raw-output 2>/dev/null || true)
+            if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+              echo "[$TS] intento $i/75: ya existe una instancia $NAME. Desactivando el workflow."
+              disable_self
+              exit 0
+            fi
 
-          FD="FAULT-DOMAIN-$(( RANDOM % 3 + 1 ))"
-          printf '%s\n' "$SSH_PUBLIC_KEY" > /tmp/ssh_key.pub
-          echo "Intentando lanzar en $FD ..."
+            AD=$(oci iam availability-domain list -c "$OCI_TENANCY_OCID" \
+              --query 'data[0].name' --raw-output)
+            SUBNET=$(oci network subnet list -c "$OCI_TENANCY_OCID" \
+              --query 'sort_by(data[?"prohibit-public-ip-on-vnic"==`false`],&"time-created")[-1].id' \
+              --raw-output)
+            if [ -z "$SUBNET" ] || [ "$SUBNET" = "null" ]; then
+              echo "[$TS] No hay subred publica. Crea una VCN con subred publica en Oracle."
+              exit 1
+            fi
+            IMAGE=$(oci compute image list -c "$OCI_TENANCY_OCID" \
+              --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+              --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED --sort-order DESC \
+              --query 'data[0].id' --raw-output)
+            if [ -z "$IMAGE" ] || [ "$IMAGE" = "null" ]; then
+              echo "[$TS] No encontre imagen Ubuntu 24.04 para A1."
+              exit 1
+            fi
 
-          set +e
-          OUT=$(oci compute instance launch \
-            --compartment-id "$OCI_TENANCY_OCID" \
-            --availability-domain "$AD" \
-            --fault-domain "$FD" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":1,"memoryInGBs":6}' \
-            --display-name "$NAME" \
-            --image-id "$IMAGE" \
-            --subnet-id "$SUBNET" \
-            --assign-public-ip true \
-            --boot-volume-size-in-gbs 200 \
-            --ssh-authorized-keys-file /tmp/ssh_key.pub 2>&1)
-          RC=$?
-          set -e
-          rm -f /tmp/ssh_key.pub
+            FD="FAULT-DOMAIN-$(( RANDOM % 3 + 1 ))"
+            printf '%s\n' "$SSH_PUBLIC_KEY" > /tmp/ssh_key.pub
 
-          if [ $RC -eq 0 ]; then
-            echo "VM creada. Desactivando el workflow."
-            disable_self
-            exit 0
-          fi
+            set +e
+            OUT=$(oci compute instance launch \
+              --compartment-id "$OCI_TENANCY_OCID" \
+              --availability-domain "$AD" \
+              --fault-domain "$FD" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+              --display-name "$NAME" \
+              --image-id "$IMAGE" \
+              --subnet-id "$SUBNET" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs 200 \
+              --ssh-authorized-keys-file /tmp/ssh_key.pub 2>&1)
+            RC=$?
+            set -e
+            rm -f /tmp/ssh_key.pub
 
-          if printf '%s' "$OUT" | grep -qiE 'out of (host )?capacity|TooManyRequests|"status": 429'; then
-            echo "sin hueco todavia"
-            exit 0
-          fi
+            if [ $RC -eq 0 ]; then
+              echo "[$TS] intento $i/75 en $FD: VM creada. Desactivando el workflow."
+              disable_self
+              exit 0
+            fi
 
-          echo "Error inesperado de Oracle:"
-          printf '%s\n' "$OUT" | tail -n 15
-          exit 1
+            if printf '%s' "$OUT" | grep -qiE 'out of (host )?capacity|TooManyRequests|"status": 429'; then
+              echo "[$TS] intento $i/75 en $FD: sin hueco todavia"
+            else
+              echo "[$TS] intento $i/75 en $FD: error inesperado de Oracle:"
+              printf '%s\n' "$OUT" | tail -n 15
+              exit 1
+            fi
+
+            if [ "$i" -lt 75 ]; then
+              sleep 240
+            fi
+          done
+
+          echo "Se agotaron los 75 intentos; el cron horario reintentara."
